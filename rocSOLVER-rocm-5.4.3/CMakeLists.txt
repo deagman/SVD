@@ -1,0 +1,259 @@
+# ########################################################################
+# Copyright (c) 2019-2022 Advanced Micro Devices, Inc.
+# ########################################################################
+
+cmake_minimum_required(VERSION 3.13)
+
+# This has to be initialized before the project() command appears
+# Set the default build type to Release
+if(NOT DEFINED CMAKE_CONFIGURATION_TYPES AND NOT DEFINED CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING
+    "Choose the type of build, options are: None Debug Release RelWithDebInfo MinSizeRel.")
+endif()
+
+if(NOT DEFINED CMAKE_Fortran_COMPILER AND NOT DEFINED ENV{FC})
+  set(CMAKE_Fortran_COMPILER  "gfortran")
+endif()
+
+# ROCM_BUILD_ID is added to the package name by rocm-cmake. Unsetting it prevents that.
+unset(ENV{ROCM_BUILD_ID})
+
+# Disable ROCMClang detection to make CMake v3.21 work the same as CMake v3.20 and earlier.
+# https://gitlab.kitware.com/cmake/cmake/-/merge_requests/6533
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.21.0 AND CMAKE_VERSION VERSION_LESS 3.21.3)
+  set(__skip_rocmclang ON)
+endif()
+message(STATUS "Using CMake ${CMAKE_VERSION}")
+
+project(rocsolver LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+option(ROCSOLVER_EMBED_FMT "Hide libfmt symbols" ON)
+option(OPTIMAL "Build specialized kernels for small matrix sizes" ON)
+option(ROCSOLVER_FIND_PACKAGE_LAPACK_CONFIG "Skip module mode search for LAPACK" ON)
+
+# Add our CMake helper files to the lookup path
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+find_package(fmt REQUIRED)
+
+# ########################################################################
+# Main
+# ########################################################################
+
+# Get rocm-cmake
+include(get-rocm-cmake)
+
+# Include the rocm-cmake components we use
+include(ROCMSetupVersion)
+include(ROCMCreatePackage)
+include(ROCMInstallTargets)
+include(ROCMPackageConfigHelpers)
+include(ROCMInstallSymlinks)
+include(ROCMCheckTargetIds)
+include(ROCMClients)
+include(ROCMHeaderWrapper)
+
+include(os-detection)
+get_os_id(OS_ID)
+message(STATUS "OS detected is ${OS_ID}")
+
+# Versioning via rocm-cmake
+set(VERSION_STRING "3.20.0")
+rocm_setup_version(VERSION ${VERSION_STRING})
+
+# Workaround until llvm and hip CMake modules fix symlink logic in their config files
+list(APPEND CMAKE_PREFIX_PATH
+  ${ROCM_PATH}
+  ${ROCM_PATH}/llvm
+  ${ROCM_PATH}/hip
+  /public/software/compiler/rocm/dtk-22.10.1
+  /public/software/compiler/rocm/dtk-22.10.1/llvm
+  /public/software/compiler/rocm/dtk-22.10.1/hip
+)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set(DEFAULT_ARMOR_LEVEL 1)
+else()
+  set(DEFAULT_ARMOR_LEVEL 0)
+endif()
+set(ARMOR_LEVEL "${DEFAULT_ARMOR_LEVEL}" CACHE STRING "Enables increasingly expensive runtime correctness checks")
+include(armor-config)
+
+# This option only works for make, nmake and ninja, but no reason it shouldn't be on all the time
+# It creates a compile_commands.json file for use with clang tooling or vim
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# BUILD_SHARED_LIBS is a cmake built-in
+# Make it an explicit option such that it shows in cmake-gui
+option(BUILD_SHARED_LIBS "Build rocSOLVER as a shared library" ON)
+
+# Include helper functions and wrapper functions
+include(util)
+include(CMakeDependentOption)
+
+option(BUILD_TESTING "Build rocSOLVER tests" OFF)
+if(BUILD_TESTING)
+  enable_testing()
+endif()
+
+option(BUILD_LIBRARY "Build rocSOLVER library" ON)
+option_opposite(BUILD_LIBRARY SKIP_LIBRARY)
+option(BUILD_CLIENTS_TESTS "Build rocSOLVER test client" "${BUILD_TESTING}")
+option(BUILD_CLIENTS_BENCHMARKS "Build rocSOLVER benchmark client" OFF)
+option(BUILD_CLIENTS_SAMPLES "Build rocSOLVER samples" OFF)
+cmake_dependent_option(BUILD_CLIENTS_EXTRA_TESTS "Build extra tests" OFF BUILD_TESTING OFF)
+option(BUILD_ADDRESS_SANITIZER "Build with address sanitizer enabled" OFF)
+option(BUILD_CODE_COVERAGE "Build rocSOLVER with code coverage enabled" OFF)
+option(WERROR "Treat warnings as errors" OFF)
+
+cmake_dependent_option(BUILD_FILE_REORG_BACKWARD_COMPATIBILITY
+  "Build with file/folder reorg backward compatibility enabled" ON "NOT WIN32" OFF)
+if(BUILD_FILE_REORG_BACKWARD_COMPATIBILITY)
+  rocm_wrap_header_dir(
+    ${CMAKE_SOURCE_DIR}/library/include/rocsolver
+    PATTERNS "*.h"
+    GUARDS SYMLINK WRAPPER
+    WRAPPER_LOCATIONS ${CMAKE_INSTALL_INCLUDEDIR}
+  )
+endif()
+
+
+message(STATUS "Tests: ${BUILD_CLIENTS_TESTS}")
+message(STATUS "Benchmarks: ${BUILD_CLIENTS_BENCHMARKS}")
+message(STATUS "Samples: ${BUILD_CLIENTS_SAMPLES}")
+
+# Query for compiler support of GPU archs
+rocm_check_target_ids(OPTIONAL_AMDGPU_TARGETS
+  TARGETS
+    gfx906
+    gfx926
+)
+
+# Set this before finding hip so that hip::device has the required arch flags
+# added as usage requirements on its interface
+set(AMDGPU_TARGETS "gfx906;gfx926;${OPTIONAL_AMDGPU_TARGETS}"
+  CACHE STRING "List of specific machine types for library to target")
+
+# Find HIP dependencies
+find_package(hip REQUIRED CONFIG PATHS ${ROCM_PATH} /public/software/compiler/rocm/dtk-22.10.1)
+
+find_package(rocblas REQUIRED CONFIG PATHS ${ROCM_PATH})
+get_imported_target_location(location roc::rocblas)
+message(STATUS "Found rocBLAS: ${location}")
+
+add_subdirectory(common)
+
+if(BUILD_LIBRARY)
+  add_subdirectory(library)
+endif()
+
+if(BUILD_CLIENTS_TESTS OR BUILD_CLIENTS_BENCHMARKS OR BUILD_CLIENTS_SAMPLES)
+  if(NOT CLIENTS_OS)
+    rocm_set_os_id(CLIENTS_OS)
+    string(TOLOWER "${CLIENTS_OS}" CLIENTS_OS)
+    rocm_read_os_release(CLIENTS_OS_VERSION VERSION_ID)
+  endif()
+  set(GFORTRAN_RPM "libgfortran4")
+  set(GFORTRAN_DEB "libgfortran4")
+  if(CLIENTS_OS STREQUAL "centos" OR CLIENTS_OS STREQUAL "rhel")
+    if(CLIENTS_OS_VERSION VERSION_GREATER_EQUAL "8")
+      set(GFORTRAN_RPM "libgfortran")
+    endif()
+  elseif(CLIENTS_OS STREQUAL "ubuntu" AND CLIENTS_OS_VERSION VERSION_GREATER_EQUAL "20.04")
+    set(GFORTRAN_DEB "libgfortran5")
+  endif()
+  rocm_package_setup_component(clients)
+  if(BUILD_CLIENTS_TESTS)
+    rocm_package_setup_client_component(tests DEPENDS DEB "${GFORTRAN_DEB}" RPM "${GFORTRAN_RPM}")
+  endif()
+  if(BUILD_CLIENTS_BENCHMARKS)
+    rocm_package_setup_client_component(benchmarks DEPENDS DEB "${GFORTRAN_DEB}" RPM "${GFORTRAN_RPM}")
+  endif()
+  add_subdirectory(clients)
+endif()
+
+# Package-specific CPACK vars
+rocm_package_add_dependencies("rocblas >= 2.46" "rocblas < 2.47")
+
+if(OS_ID_sles)
+  rocm_package_add_rpm_dependencies("libLLVM >= 7.0.1")
+endif()
+
+set(CPACK_RESOURCE_FILE_LICENSE "${PROJECT_SOURCE_DIR}/LICENSE.md")
+set(CPACK_RPM_PACKAGE_LICENSE "BSD")
+
+if(WIN32)
+  set(CPACK_SOURCE_GENERATOR "ZIP")
+  set(CPACK_GENERATOR "ZIP")
+  set(CMAKE_INSTALL_PREFIX "C:/hipSDK" CACHE PATH "Install path" FORCE)
+  set(INSTALL_PREFIX "C:/hipSDK")
+  set(CPACK_SET_DESTDIR OFF)
+  set(CPACK_PACKAGE_INSTALL_DIRECTORY "C:/hipSDK")
+  set(CPACK_PACKAGING_INSTALL_PREFIX "")
+  set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
+else()
+  if(NOT CPACK_PACKAGING_INSTALL_PREFIX)
+    set(CPACK_PACKAGING_INSTALL_PREFIX "${ROCM_PATH}")
+  endif()
+endif()
+
+set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
+  "\${CPACK_PACKAGING_INSTALL_PREFIX}"
+)
+
+set(ROCSOLVER_CONFIG_DIR "\${CPACK_PACKAGING_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}"
+  CACHE PATH "Path placed into ldconfig file")
+
+rocm_create_package(
+  NAME rocsolver
+  DESCRIPTION "AMD ROCm SOLVER library"
+  MAINTAINER "RocSOLVER maintainer <rocsolver-maintainer@amd.com>"
+  LDCONFIG
+  LDCONFIG_DIR ${ROCSOLVER_CONFIG_DIR}
+)
+
+# Code Coverage Build Commands:
+#   make coverage_cleanup (clean coverage related files)
+#   make coverage GTEST_FILTER=<>
+#   make coverage_analysis GTEST_FILTER=<> (analyze tests)
+#   make coverage_output (generate html documentation)
+if(BUILD_CODE_COVERAGE)
+  # Run coverage analysis
+  add_custom_target(coverage_analysis
+    COMMAND echo Coverage GTEST_FILTER=\${GTEST_FILTER}
+    COMMAND ./clients/staging/rocsolver-test --gtest_filter=\"\${GTEST_FILTER}\"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+  )
+  add_dependencies(coverage_analysis rocsolver)
+
+  # Generate gcov-tool script
+  # This little script is generated because the option '--gcov-tool <program name>' of lcov cannot take arguments.
+  add_custom_target(coverage_output
+    DEPENDS coverage_analysis
+    COMMAND mkdir -p lcoverage
+    COMMAND echo "\\#!/bin/bash" > llvm-gcov.sh
+    COMMAND echo "\\# THIS FILE HAS BEEN GENERATED" >> llvm-gcov.sh
+    COMMAND printf "exec /public/software/compiler/rocm/dtk-22.10.1/llvm/bin/llvm-cov gcov $$\\@" >> llvm-gcov.sh
+    COMMAND chmod +x llvm-gcov.sh
+  )
+
+  # Generate code coverage report
+  add_custom_command(TARGET coverage_output
+    COMMAND lcov --directory . --base-directory . --gcov-tool ${CMAKE_BINARY_DIR}/llvm-gcov.sh --capture -o lcoverage/raw_main_coverage.info
+    COMMAND lcov --remove lcoverage/raw_main_coverage.info "'/opt/*'" "'/usr/*'" -o lcoverage/main_coverage.info
+    COMMAND genhtml --ignore-errors source lcoverage/main_coverage.info --output-directory lcoverage
+  )
+  add_custom_target(coverage DEPENDS coverage_output)
+
+  # Delete gcov data files
+  add_custom_target(coverage_cleanup
+    COMMAND find ${CMAKE_BINARY_DIR} -name *.gcda -delete
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+  )
+endif()

@@ -1,0 +1,8 @@
+libdir=/public/home/wangqingwei/lapack-3.9.1/build/fmt-install/lib64
+includedir=/public/home/wangqingwei/lapack-3.9.1/build/fmt-install/include
+
+Name: BLAS
+Description: FORTRAN reference implementation of BLAS Basic Linear Algebra Subprograms
+Version: 3.9.1
+URL: http://www.netlib.org/blas/
+Libs: -L${libdir} -lblas
